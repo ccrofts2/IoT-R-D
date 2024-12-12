@@ -1,0 +1,175 @@
+import sys
+import argparse
+import socket
+import struct
+import os
+import crypto_utils as utils
+import message
+
+# Constants for port, host, nonce size, sequence number size, and MAC size
+DEFAULT_PORT = 8087
+DEFAULT_HOST = "localhost"
+
+NONCE_SIZE = 32
+SEQUENCE_NUMBER_SIZE = 4
+MAC_SIZE = 32
+
+
+def process_data_message(data_msg, server_encryption_key, server_integrity_key, seq):
+    try:
+        decrypted_data = utils.decrypt(data_msg.data, server_encryption_key)
+        recv_seq = int.from_bytes(
+            decrypted_data[:SEQUENCE_NUMBER_SIZE], byteorder="big"
+        )
+        chunk = decrypted_data[SEQUENCE_NUMBER_SIZE:-MAC_SIZE]
+        received_mac = decrypted_data[-MAC_SIZE:]
+        calculated_mac = utils.mac(chunk, server_integrity_key)  # MAC Calculation
+        if received_mac != calculated_mac:
+            raise Exception("MAC mismatch")
+
+        if recv_seq != seq:
+            raise Exception("Sequence number mismatch")
+
+        return chunk, recv_seq
+
+    except Exception as e:
+        return None, None
+
+
+def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Simple TLS client")
+    parser.add_argument("file", help="The file name to save to. Use - for stdout.")
+    parser.add_argument(
+        "-p", "--port", type=int, default=DEFAULT_PORT, help="Port to connect to."
+    )
+    parser.add_argument("--host", default=DEFAULT_HOST, help="Hostname to connect to.")
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Turn on debugging output."
+    )
+    args = parser.parse_args()
+
+    verbose = args.verbose
+
+    try:
+        with socket.create_connection((args.host, args.port)) as sock:
+            # Handshake: Hello, Certificate, Nonce
+            hello_msg = message.Message(message.MessageType.HELLO)
+            sock.sendall(hello_msg.to_bytes())
+
+            cert_msg = message.Message.from_socket(sock)
+            if not cert_msg or cert_msg.type != message.MessageType.CERTIFICATE:
+                raise Exception("Invalid certificate message received")
+            server_nonce = cert_msg.data[:NONCE_SIZE]
+            server_cert_bytes = cert_msg.data[NONCE_SIZE:]
+            server_cert = utils.load_certificate(server_cert_bytes)
+            if not server_cert:
+                raise Exception("Invalid certificate")
+
+            client_nonce = os.urandom(NONCE_SIZE)
+            public_key = server_cert.public_key()
+            encrypted_nonce = utils.encrypt_with_public_key(client_nonce, public_key)
+            nonce_msg = message.Message(message.MessageType.NONCE, encrypted_nonce)
+            sock.sendall(nonce_msg.to_bytes())
+
+            # ---------------------------------------------------
+            # Handshake MAC Verification
+            # ---------------------------------------------------
+
+            (
+                server_encryption_key,
+                server_integrity_key,
+                client_encryption_key,
+                client_integrity_key,
+            ) = utils.generate_keys(client_nonce, server_nonce)
+
+            server_mac_msg = message.Message.from_socket(sock)
+            if not server_mac_msg or server_mac_msg.type != message.MessageType.HASH:
+                raise Exception("Invalid server MAC message received")
+            received_server_mac = server_mac_msg.data
+
+            messages_to_mac = [hello_msg, cert_msg, nonce_msg]
+            expected_server_mac = utils.mac(
+                b"".join(m.to_bytes() for m in messages_to_mac), server_integrity_key
+            )
+
+            if received_server_mac != expected_server_mac:
+                raise Exception("Server MAC mismatch")
+
+            client_mac = utils.mac(
+                b"".join(m.to_bytes() for m in messages_to_mac), client_integrity_key
+            )
+            client_mac_msg = message.Message(message.MessageType.HASH, client_mac)
+            sock.sendall(client_mac_msg.to_bytes())
+
+            # ---------------------------------------------------
+            # Data Transfer (after handshake)
+            # ---------------------------------------------------
+
+            seq = 0
+            image_data = b""
+            while True:
+                try:
+                    data_msg = message.Message.from_socket(sock)
+                    if data_msg is None:
+                        print("Connection closed by server.", file=sys.stderr)
+                        break
+                    if (
+                        data_msg.type != message.MessageType.DATA
+                    ):  # Check message type *before* processing
+                        print(
+                            f"Unexpected message type: {data_msg.type}", file=sys.stderr
+                        )
+                        break
+
+                    decrypted_data, recv_seq = process_data_message(
+                        data_msg, server_encryption_key, server_integrity_key, seq
+                    )
+                    if decrypted_data is None:  # Error in process_data_message
+                        print(
+                            "Error processing data message. Exiting.", file=sys.stderr
+                        )
+                        sys.exit(1)
+
+                    image_data += decrypted_data
+                    seq += 1
+
+                except (socket.timeout, socket.error) as e:
+                    print(f"Socket error: {e}", file=sys.stderr)
+                    break  # Exit loop on socket error
+                except Exception as e:  # Handle other unexpected errors
+                    print(f"An unexpected error occurred: {e}", file=sys.stderr)
+                    import traceback
+
+                    traceback.print_exc()
+                    sys.exit(1)
+
+                except Exception as e:
+                    print(f"A major error occurred: {e}", file=sys.stderr)
+                    # Handle the error appropriately
+
+        # Write the received data to a file or stdout
+        if args.file == "-":
+            if image_data:  # Check if data is not empty
+                sys.stdout.buffer.write(image_data)
+                sys.stdout.flush()
+                print(
+                    f"Wrote {len(image_data)} bytes to stdout.", file=sys.stderr
+                )  # Confirmation
+            else:
+                print("Error: No image data received.", file=sys.stderr)
+                sys.exit(1)
+        else:
+            with open(args.file, "wb") as f:
+                f.write(image_data)
+                print(
+                    f"Wrote {len(image_data)} bytes to file: {args.file}",
+                    file=sys.stderr,
+                )  # Confirmation
+
+    except Exception as e:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
