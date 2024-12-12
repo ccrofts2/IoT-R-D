@@ -1,0 +1,140 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <nvs_flash.h>
+#include <mbedtls/md.h>
+
+#define KEY_SIZE 16
+#define NVS_NAMESPACE "my_keys"
+
+uint8_t broadcastAddress[] = {0x08, 0xB6, 0x1F, 0xB9, 0x61, 0x48};
+uint8_t pmk[KEY_SIZE]; // To store the PMK
+uint8_t authKey[KEY_SIZE];
+uint8_t salt[KEY_SIZE];
+
+
+typedef struct struct_message {
+  char a[32];
+  int b;
+  float c;
+  bool d;
+  uint32_t seq_num;
+  uint8_t hmac[32];
+} struct_message;
+
+uint32_t seq = 0;
+
+struct_message myData;
+esp_now_peer_info_t peerInfo;
+
+
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("\r\nLast Packet Send Status:\t");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+}
+ 
+void setup() {
+  Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
+  // Init NVS
+  esp_err_t err = nvs_flash_init();
+  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    err = nvs_flash_init();
+  }
+  ESP_ERROR_CHECK(err);
+
+  nvs_handle_t my_handle;
+  err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &my_handle); // Use existing 'err'
+  if (err != ESP_OK) {
+    Serial.println("Error opening NVS namespace");
+    return;
+  }
+
+
+    size_t authKey_len = sizeof(authKey);
+    err = nvs_get_blob(my_handle, "authKey", authKey, &authKey_len);
+    if (err != ESP_OK) {
+        Serial.println("Error reading authKey from NVS");
+        nvs_close(my_handle); 
+        return;
+    }
+
+    size_t pmk_len = sizeof(pmk);
+    err = nvs_get_blob(my_handle, "pmk", pmk, &pmk_len);
+    if (err != ESP_OK) {
+        Serial.println("Error reading PMK from NVS");
+        nvs_close(my_handle);  // Close NVS handle on error
+        return;
+    }
+    size_t salt_len = sizeof(salt);
+    
+err = nvs_get_blob(my_handle, "salt", salt, &salt_len);
+if (err != ESP_OK) {
+Serial.println("Error reading salt from NVS");
+nvs_close(my_handle);
+return;
+}
+
+    nvs_close(my_handle); 
+    
+  // Set PMK
+  esp_now_set_pmk(pmk);
+  
+  // Init ESP NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+
+  // Add peer
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = true; 
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
+    return;
+  }
+    esp_now_register_send_cb(OnDataSent);
+
+}
+void loop() {
+  strcpy(myData.a, "Hello, this is a Char");
+  myData.b = random(1,100);
+  myData.c = 2.5;
+  myData.d = true;
+  
+  Serial.print("Sending sequence number: ");
+  Serial.println(myData.seq_num);
+    myData.seq_num = seq;
+    seq++; // Increment sequence number
+
+  // HMAC Calculation
+    uint8_t hmac[32];
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    int ret = mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+    if (ret != 0) { Serial.printf("mbedtls_md_setup failed: -0x%04X\n", -ret); return; }
+    ret = mbedtls_md_hmac_starts(&ctx, authKey, sizeof(authKey)); //Added this function back
+    if (ret != 0) { Serial.printf("mbedtls_md_hmac_starts failed: -0x%04X\n", -ret); return;}
+
+    ret = mbedtls_md_hmac_update(&ctx, (const unsigned char*)&myData, sizeof(myData) - sizeof(myData.hmac)); // Only ONE call to hmac_update
+    if (ret != 0) { Serial.printf("mbedtls_md_hmac_update failed: -0x%04X\n", -ret); return;}
+
+    ret = mbedtls_md_hmac_finish(&ctx, hmac);
+    if (ret != 0) { Serial.printf("mbedtls_md_hmac_finish failed: -0x%04X\n", -ret); return;}
+    mbedtls_md_free(&ctx);
+    
+    memcpy(myData.hmac, hmac, sizeof(hmac));
+  
+  // Send message via ESP-NOW
+  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
+   
+  if (result == ESP_OK) {
+    Serial.println("Sent with success");
+  }
+  else {
+    Serial.println("Error sending the data");
+  }
+  delay(2000);
+}
