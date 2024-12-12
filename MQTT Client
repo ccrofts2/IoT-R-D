@@ -1,0 +1,86 @@
+import argparse
+import sys
+import time
+import warnings
+import logging
+import paho.mqtt.client as mqtt
+
+# Suppress DeprecationWarnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# Configure logging to write to a file
+logging.basicConfig(filename="mqtt_client.log", level=logging.INFO)
+
+
+# Define the callback functions
+def on_connect(client, userdata, flags, rc):
+    logging.info(f"Connected with result code {rc}")
+    client.subscribe(f"{userdata['netid']}/{userdata['action']}/response")
+
+
+def on_message(client, userdata, msg):
+    print(msg.payload.decode())
+    client.user_data_set({"received": True})
+    client.disconnect()
+
+
+def on_publish(client, userdata, mid):
+    logging.info("Message published")
+
+
+# Parse command-line arguments
+def parse_args():
+    parser = argparse.ArgumentParser(description="MQTT Client")
+    parser.add_argument("action", type=str, help="Action to perform")
+    parser.add_argument("message", type=str, help="Message to publish")
+    parser.add_argument("-p", "--port", type=int, default=1883, help="Port number")
+    parser.add_argument("--host", type=str, default="localhost", help="Hostname")
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable verbose output"
+    )
+    return parser.parse_args()
+
+
+# Main function
+def main():
+    args = parse_args()
+    valid_actions = ["uppercase", "lowercase"]  # Add more valid actions as needed
+
+    if args.action not in valid_actions:
+        print(f"Error: Invalid action '{args.action}'", file=sys.stderr)
+        sys.exit(1)
+
+    client_id = args.netid
+    topic_request = f"{args.netid}/{args.action}/request"
+    topic_response = f"{args.netid}/{args.action}/response"
+
+    client = mqtt.Client(
+        client_id=client_id,
+        userdata={"netid": args.netid, "action": args.action, "received": False},
+    )
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.on_publish = on_publish
+
+    client.connect(args.host, args.port, 60)
+    client.loop_start()
+
+    client.publish(topic_request, args.message, qos=1)
+
+    start_time = time.time()
+    timeout = 30  # Increase timeout to 30 seconds
+
+    while not client._userdata["received"]:
+        if time.time() - start_time > timeout:
+            print("Error: Response timed out", file=sys.stderr)
+            client.loop_stop()
+            client.disconnect()
+            sys.exit(1)
+        time.sleep(1)
+
+    client.loop_stop()
+    client.disconnect()
+
+
+if __name__ == "__main__":
+    main()
